@@ -1,0 +1,156 @@
+# StrategyLab production stack — runs 24/7 on any Linux VM with Docker.
+#
+#   cp .env.example .env   # edit secrets
+#   docker compose up -d --build
+#
+# Every service: `restart: always` (comes back after crashes AND host reboots), a
+# healthcheck, log rotation. `autoheal` restarts any container whose healthcheck fails
+# (e.g. a process that is alive but wedged). Research runs in its own CPU-limited
+# container so it can never slow down paper trading.
+
+x-app: &app
+  build: .
+  image: strategylab:latest
+  env_file: .env
+  environment:
+    SL_DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-strategylab}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-strategylab}
+  restart: always
+  depends_on:
+    migrate:
+      condition: service_completed_successfully
+  labels:
+    autoheal: "true"
+  logging: &logging
+    driver: json-file
+    options: { max-size: "20m", max-file: "10" }
+
+services:
+  db:
+    image: postgres:16-alpine
+    restart: always
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-strategylab}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-strategylab}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+    # synchronous_commit stays ON (default) so committed trades survive power loss
+    command: ["postgres", "-c", "max_connections=100", "-c", "shared_buffers=256MB"]
+    logging: *logging
+
+  migrate:
+    build: .
+    image: strategylab:latest
+    env_file: .env
+    environment:
+      SL_DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-strategylab}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-strategylab}
+    command: ["python", "-m", "app.cli", "init-db"]
+    depends_on:
+      db: { condition: service_healthy }
+    restart: "no"
+    logging: *logging
+
+  engine:
+    <<: *app
+    command: ["python", "-m", "app.cli", "engine"]
+    stop_grace_period: 30s
+    healthcheck:
+      test: ["CMD", "python", "-m", "app.cli", "healthcheck", "engine"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    deploy:
+      resources:
+        limits: { cpus: "1.0", memory: 512M }
+
+  worker:
+    <<: *app
+    command: ["python", "-m", "app.cli", "worker"]
+    stop_grace_period: 5m   # let a running backtest finish on deploy
+    healthcheck:
+      test: ["CMD", "python", "-m", "app.cli", "healthcheck", "research-worker"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    deploy:
+      resources:
+        # hard cap so optimisation jobs can't starve the engine
+        limits: { cpus: "${WORKER_CPUS:-1.0}", memory: 1G }
+
+  scheduler:
+    <<: *app
+    command: ["python", "-m", "app.cli", "scheduler"]
+    healthcheck:
+      test: ["CMD", "python", "-m", "app.cli", "healthcheck", "scheduler"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    deploy:
+      resources:
+        limits: { cpus: "0.25", memory: 256M }
+
+  watchdog:
+    <<: *app
+    command: ["python", "-m", "app.cli", "watchdog"]
+    healthcheck:
+      test: ["CMD", "python", "-m", "app.cli", "healthcheck", "watchdog"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    deploy:
+      resources:
+        limits: { cpus: "0.25", memory: 256M }
+
+  api:
+    <<: *app
+    command: ["python", "-m", "app.cli", "api"]
+    ports:
+      - "${API_BIND:-127.0.0.1}:8000:8000"   # put Caddy/nginx with TLS in front
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:8000/health/live',timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    deploy:
+      resources:
+        limits: { cpus: "0.5", memory: 384M }
+
+  backup:
+    image: postgres:16-alpine
+    restart: always
+    environment:
+      PGHOST: db
+      PGUSER: ${POSTGRES_USER:-strategylab}
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+      PGDATABASE: ${POSTGRES_DB:-strategylab}
+      BACKUP_RETENTION_DAYS: ${BACKUP_RETENTION_DAYS:-14}
+      BACKUP_INTERVAL_SECONDS: ${BACKUP_INTERVAL_SECONDS:-21600}
+    volumes:
+      - ./deploy/backup:/scripts:ro
+      - ${BACKUP_DIR:-./backups}:/backups
+    entrypoint: ["/bin/sh", "/scripts/backup-loop.sh"]
+    depends_on:
+      db: { condition: service_healthy }
+    logging: *logging
+
+  autoheal:
+    image: willfarrell/autoheal:1.2.0
+    restart: always
+    environment:
+      AUTOHEAL_CONTAINER_LABEL: autoheal
+      AUTOHEAL_INTERVAL: 30
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    logging: *logging
+
+volumes:
+  pgdata:

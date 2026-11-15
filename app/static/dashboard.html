@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>StrategyLab Health</title>
+<style>
+:root{--bg:#f6f7f9;--card:#fff;--fg:#1b1f24;--muted:#667085;--line:#e4e7ec;--ok:#12805c;--warn:#b54708;--bad:#c01048;--chip:#eef1f5}
+@media (prefers-color-scheme:dark){:root{--bg:#0f1115;--card:#171a21;--fg:#e6e8eb;--muted:#98a2b3;--line:#2a2f3a;--ok:#3ccb8f;--warn:#f5a524;--bad:#ff5c8a;--chip:#222734}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.45 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+header{padding:16px;display:flex;flex-wrap:wrap;gap:12px;align-items:center;justify-content:space-between;border-bottom:1px solid var(--line);background:var(--card)}
+h1{font-size:18px;margin:0}h2{font-size:13px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);margin:0 0 10px}
+main{padding:16px;display:grid;gap:16px;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));max-width:1400px;margin:auto}
+.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px;overflow-x:auto}
+.wide{grid-column:1/-1}table{width:100%;border-collapse:collapse;font-size:13px}td,th{text-align:left;padding:6px 8px;border-bottom:1px solid var(--line);white-space:nowrap}th{color:var(--muted);font-weight:500}
+.pill{display:inline-block;padding:2px 8px;border-radius:999px;font-size:12px;font-weight:600;background:var(--chip)}
+.ok{color:var(--ok)}.warn{color:var(--warn)}.bad{color:var(--bad)}.muted{color:var(--muted)}
+.kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px}.kpi{border:1px solid var(--line);border-radius:8px;padding:10px}.kpi b{display:block;font-size:18px;margin-top:2px}
+.banner{font-size:12px;color:var(--muted)}
+</style>
+</head>
+<body>
+<header>
+  <div><h1>StrategyLab · System Health</h1><div class="banner">Simulated paper trading only — no real orders, no broker connection.</div></div>
+  <div id="overall" class="pill">loading…</div>
+</header>
+<main>
+  <section class="card wide"><h2>Overview</h2><div class="kpis" id="kpis"></div><div id="problems" style="margin-top:10px"></div></section>
+  <section class="card"><h2>Services</h2><table id="components"></table></section>
+  <section class="card"><h2>Market data</h2><table id="feeds"></table></section>
+  <section class="card wide"><h2>Paper strategies</h2><table id="strategies"></table></section>
+  <section class="card"><h2>Background jobs</h2><table id="jobs"></table></section>
+  <section class="card"><h2>Failed jobs</h2><table id="failed"></table></section>
+  <section class="card wide"><h2>Notifications</h2><table id="notifs"></table></section>
+</main>
+<script>
+const esc=s=>String(s??"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+const ago=iso=>{if(!iso)return"never";const s=(Date.now()-new Date(iso))/1000;if(s<90)return Math.round(s)+"s ago";if(s<5400)return Math.round(s/60)+"m ago";if(s<172800)return Math.round(s/3600)+"h ago";return Math.round(s/86400)+"d ago"};
+const cls=v=>({ok:"ok",live:"ok",up:"ok",running:"ok",idle:"muted",busy:"ok",succeeded:"ok",closed:"muted",queued:"muted",degraded:"warn",delayed:"warn",standby:"muted",warning:"warn",info:"muted"}[v]||"bad");
+const pill=v=>`<span class="pill ${cls(v)}">${esc(v)}</span>`;
+const table=(id,head,rows)=>document.getElementById(id).innerHTML=`<tr>${head.map(h=>`<th>${h}</th>`).join("")}</tr>`+(rows.length?rows.join(""):`<tr><td class="muted" colspan="${head.length}">none</td></tr>`);
+async function load(){
+  let st;
+  try{st=await (await fetch("/api/status")).json()}catch(e){document.getElementById("overall").outerHTML=`<div id="overall" class="pill bad">backend unreachable</div>`;return}
+  document.getElementById("overall").outerHTML=`<div id="overall">${pill(st.overall)}</div>`;
+  const k=[["Database",pill(st.database.status)],["Active paper strategies",st.active_paper_strategies??0],["Last market update",ago(st.last_successful_market_update)],["Last strategy evaluation",ago(st.last_strategy_evaluation)],["Jobs queued / running",`${st.jobs?.counts?.queued||0} / ${st.jobs?.counts?.running||0}`],["Failed jobs",st.jobs?.counts?.failed||0]];
+  document.getElementById("kpis").innerHTML=k.map(([a,b])=>`<div class="kpi"><span class="muted">${a}</span><b>${b}</b></div>`).join("");
+  document.getElementById("problems").innerHTML=(st.problems||[]).map(p=>`<div class="bad">• ${esc(p)}</div>`).join("");
+  table("components",["Service","Status","Last seen","CPU","Mem"],(st.components||[]).map(c=>`<tr><td>${esc(c.component)}</td><td>${pill(c.status)}</td><td>${ago(c.last_seen_at)}</td><td>${c.cpu_percent??"–"}%</td><td>${c.memory_mb??"–"} MB</td></tr>`));
+  table("feeds",["Instrument","Feed","Market","Last candle","Next change"],(st.market_data||[]).map(f=>`<tr><td>${f.instrument}</td><td>${pill(f.state)}</td><td>${f.market.is_open?"open":"closed"} <span class="muted">${esc(f.market.reason)}</span></td><td>${f.last_candle_ts?new Date(f.last_candle_ts).toLocaleString():"–"}</td><td>${f.market.next_change?new Date(f.market.next_change).toLocaleString():"–"}</td></tr>`));
+  table("strategies",["Name","Kind","Market","Paper","Status","Last eval","Position","Unrealised"],(st.strategies||[]).map(s=>{const p=s.open_position;return`<tr><td>${esc(s.name)}</td><td>${s.kind}</td><td>${s.instrument} ${s.timeframe}</td><td>${s.paper_active?"on":"off"}</td><td>${pill(s.status)} <span class="muted">${esc(s.status_detail||"")}</span></td><td>${ago(s.last_evaluated_at)}</td><td>${p?`${p.side} @ ${p.entry_price.toFixed(2)}`:"–"}</td><td class="${p&&p.unrealised_pnl<0?"bad":"ok"}">${p?p.unrealised_pnl.toFixed(2):"–"}</td></tr>`}));
+  const jr=j=>`<tr><td>#${j.id}</td><td>${j.kind}</td><td>${pill(j.status)}</td><td>${j.attempts}</td><td>${ago(j.finished_at||j.started_at||j.created_at)}</td><td class="muted">${esc(j.error||"")}</td></tr>`;
+  table("jobs",["Job","Kind","Status","Tries","When",""],(st.jobs?.recent||[]).map(jr));
+  table("failed",["Job","Kind","Status","Tries","When","Error"],(st.jobs?.failed||[]).map(jr));
+  try{const n=await (await fetch("/api/notifications?limit=25")).json();table("notifs",["When","Severity","Title","Detail"],n.map(x=>`<tr><td>${ago(x.created_at)}</td><td>${pill(x.severity)}</td><td>${esc(x.title)}</td><td class="muted">${esc(x.body)}</td></tr>`))}catch(e){}
+}
+load();setInterval(load,10000);
+</script>
+</body>
+</html>
